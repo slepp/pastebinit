@@ -23,9 +23,11 @@ from __future__ import print_function
 
 import argparse
 import gettext
+import hashlib
 import os
 import re
 import socket
+import time
 import xml.dom.minidom
 
 import sys
@@ -157,6 +159,31 @@ def getParameters(website, content):
             params[paramname] = config.get('defaults', param,
                 vars=spec_opts, fallback=inline_opts.get(param))
     return params
+
+
+def getPowParameters(website, config):
+    """Solve a pastebin.ca-compatible anonymous submission challenge."""
+    challenge_url = website + config['pow_page'].lstrip('/')
+    with request.urlopen(PasteRequest(challenge_url)) as response:
+        challenge = json.loads(response.read().decode('utf-8'))
+
+    difficulty = challenge['difficulty_bits']
+    if type(difficulty) is not int or not 0 <= difficulty <= 256:
+        raise ValueError("Invalid proof-of-work difficulty")
+
+    prefix = challenge['prefix'].encode('utf-8')
+    target = 1 << (256 - difficulty)
+    deadline = time.monotonic() + 30
+    nonce = 0
+    while time.monotonic() < deadline:
+        value = str(nonce)
+        digest = hashlib.sha256(prefix + value.encode('ascii')).digest()
+        if int.from_bytes(digest, 'big') < target:
+            return {'pow_challenge_id': challenge['challenge_id'],
+                    'pow_nonce': value}
+        nonce += 1
+
+    raise ValueError("Proof-of-work challenge exceeded 30 seconds")
 
 
 # XML Handling methods
@@ -455,22 +482,25 @@ if __name__ == "__main__":
 
             req = PasteRequest(post_url)
 
-            if post_format == 'json':
-                if json:
-                    params = bytes(json.dumps(params), encoding='US-ASCII')
-                    req.add_header('Content-Type', 'text/json')
-                else:
-                    print(_("Could not find any JSON library."), file=sys.stderr)
-                    sys.exit(1)
-            else:
-                # Convert to a format usable with the HTML POST
-                params = bytes(urlencode(params), encoding='US-ASCII')
-
-            # Send the informations and be redirected to the final page
-            if verbose:
-                print("POSTing to: %s\nParams: %s" % (
-                      post_url, str(params)), file=sys.stderr)
             try:
+                if post_format == 'json':
+                    if json:
+                        if 'pow_page' in config:
+                            params.update(getPowParameters(website, config))
+                        params = bytes(json.dumps(params), encoding='US-ASCII')
+                        req.add_header('Content-Type',
+                                       config.get('content_type', 'text/json'))
+                    else:
+                        print(_("Could not find any JSON library."), file=sys.stderr)
+                        sys.exit(1)
+                else:
+                    # Convert to a format usable with the HTML POST
+                    params = bytes(urlencode(params), encoding='US-ASCII')
+
+                # Send the informations and be redirected to the final page
+                if verbose:
+                    print("POSTing to: %s\nParams: %s" % (
+                          post_url, str(params)), file=sys.stderr)
                 page = request.urlopen(req, params)
             except HTTPError as e:
                 print(_("HTTP Error contacting the server: %s") % e, file=sys.stderr)
