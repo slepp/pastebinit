@@ -2,12 +2,14 @@
 
 import contextlib
 from email.message import Message
+import gettext
 import hashlib
 import io
 import json
 import os
 from pathlib import Path
 import runpy
+import socket
 import tempfile
 import unittest
 from unittest import mock
@@ -45,7 +47,7 @@ class ProviderTests(unittest.TestCase):
             challenge = {
                 'challenge_id': 'challenge-%d' % len(self.challenges),
                 'prefix': 'pastebinit-test-%d:' % len(self.challenges),
-                'difficulty_bits': 8,
+                'difficulty_bits': 13,
                 'expires_at': 9999999999999,
             }
             self.challenges.append(challenge)
@@ -61,11 +63,25 @@ class ProviderTests(unittest.TestCase):
         self.assertIsInstance(nonce, str)
         self.assertTrue(nonce.isdecimal())
         digest = hashlib.sha256((challenge['prefix'] + nonce).encode()).digest()
-        self.assertEqual(digest[0], 0)
+        bits = ''.join(format(byte, '08b') for byte in digest)
+        self.assertTrue(bits.startswith('0' * challenge['difficulty_bits']))
         self.submissions.append(payload)
         url = 'https://pastebin.ca/%dAbCdEfgHj' % (len(self.submissions) + 1)
         # raw_url deliberately comes first: stdout must contain the view URL.
         return response(json.dumps({'raw_url': url + '/raw', 'url': url}))
+
+    def authenticated_pastebin_ca(self, req, data=None):
+        self.assertEqual(req.full_url, CREATE_URL)
+        self.assertEqual(req.get_header('Authorization'), 'Bearer ' + TEST_TOKEN)
+        self.assertEqual(req.get_header('Content-type'), 'application/json')
+        self.assertIsNotNone(data)
+        self.assertNotIn(TEST_TOKEN.encode(), data)
+        payload = json.loads(data)
+        self.assertNotIn('pow_challenge_id', payload)
+        self.assertNotIn('pow_nonce', payload)
+        self.submissions.append(payload)
+        url = 'https://pastebin.ca/%dAbCdEfgHj' % (len(self.submissions) + 1)
+        return response(json.dumps({'url': url}))
 
     def run_cli(self, arguments, content='', handler=None, env=None,
                 provider_config=None):
@@ -103,7 +119,8 @@ class ProviderTests(unittest.TestCase):
             return real_build_opener(request.ProxyHandler({}),
                                      *handlers, TestTransport())
 
-        with mock.patch('sys.argv', ['pastebinit'] + arguments), \
+        with contextlib.ExitStack() as cleanup, \
+                mock.patch('sys.argv', ['pastebinit'] + arguments), \
                 mock.patch('sys.stdin', io.StringIO(content)), \
                 mock.patch.dict(os.environ, environment, clear=True), \
                 mock.patch('builtins.open', side_effect=without_user_config), \
@@ -115,6 +132,9 @@ class ProviderTests(unittest.TestCase):
                            side_effect=offline_opener), \
                 contextlib.redirect_stdout(stdout), \
                 contextlib.redirect_stderr(stderr):
+            cleanup.callback(socket.setdefaulttimeout,
+                             socket.getdefaulttimeout())
+            cleanup.callback(gettext.textdomain, gettext.textdomain())
             try:
                 runpy.run_path(str(SCRIPT), run_name='__main__')
                 code = 0
@@ -143,18 +163,87 @@ class ProviderTests(unittest.TestCase):
         self.assertEqual(stdout, 'https://pastebin.ca/2AbCdEfgHj\n')
         self.assertEqual(len(self.challenges), 1)
 
-    def authenticated_pastebin_ca(self, req, data=None):
-        self.assertEqual(req.full_url, CREATE_URL)
-        self.assertEqual(req.get_header('Authorization'), 'Bearer ' + TEST_TOKEN)
-        self.assertEqual(req.get_header('Content-type'), 'application/json')
-        self.assertIsNotNone(data)
-        self.assertNotIn(TEST_TOKEN.encode(), data)
-        payload = json.loads(data)
-        self.assertNotIn('pow_challenge_id', payload)
-        self.assertNotIn('pow_nonce', payload)
-        self.submissions.append(payload)
-        url = 'https://pastebin.ca/%dAbCdEfgHj' % (len(self.submissions) + 1)
-        return response(json.dumps({'url': url}))
+    def test_each_input_file_gets_a_fresh_challenge_and_cli_options(self):
+        with tempfile.TemporaryDirectory() as directory:
+            files = [Path(directory) / 'one.txt', Path(directory) / 'two.txt']
+            files[0].write_text('first file\n')
+            files[1].write_text('second file\n')
+            code, stdout, stderr = self.run_cli([
+                '-b', 'https://pastebin.ca/', '-t', 'A test title',
+                '-f', 'python', '-e', '30m', '-P', 'public',
+                '-i', *map(str, files)])
+        self.assertEqual((code, stderr), (0, ''))
+        self.assertEqual(stdout.splitlines(), [
+            'https://pastebin.ca/2AbCdEfgHj',
+            'https://pastebin.ca/3AbCdEfgHj'])
+        self.assertEqual(len(self.challenges), 2)
+        self.assertEqual([p['body'] for p in self.submissions],
+                         ['first file', 'second file'])
+        self.assertNotEqual(self.submissions[0]['pow_challenge_id'],
+                            self.submissions[1]['pow_challenge_id'])
+        for payload in self.submissions:
+            self.assertEqual(payload['title'], 'A test title')
+            self.assertEqual(payload['syntax_hint'], 'python')
+            self.assertEqual(payload['expires_in'], '30m')
+            self.assertEqual(payload['visibility'], 'public')
+
+    def test_invalid_challenge_difficulty_does_not_submit(self):
+        for difficulty in (-1, 257, '22', True):
+            with self.subTest(difficulty=difficulty):
+                def bad_challenge(req, data=None):
+                    self.assertIsNone(data)
+                    return response(json.dumps({
+                        'challenge_id': 'bad', 'prefix': 'test',
+                        'difficulty_bits': difficulty}))
+
+                code, stdout, stderr = self.run_cli(
+                    ['-b', 'pastebin.ca'], 'test', bad_challenge)
+                self.assertEqual(code, 1)
+                self.assertEqual(stdout, '')
+                self.assertIn('Invalid proof-of-work difficulty', stderr)
+
+    def test_work_is_bounded_and_timeout_does_not_submit(self):
+        elapsed = 0
+        real_sha256 = hashlib.sha256
+
+        def slow_hash(data):
+            nonlocal elapsed
+            elapsed += 10
+            return real_sha256(data)
+
+        with mock.patch('time.monotonic', side_effect=lambda: elapsed), \
+                mock.patch('hashlib.sha256', side_effect=slow_hash):
+            code, stdout, stderr = self.run_cli(['-b', 'pastebin.ca'], 'test')
+        self.assertEqual(code, 1)
+        self.assertEqual(stdout, '')
+        self.assertIn('exceeded 30 seconds', stderr)
+        self.assertGreater(elapsed, 0)
+        self.assertEqual(self.submissions, [])
+
+    def test_http_rejection_does_not_print_a_success_url(self):
+        def rejected(req, data=None):
+            if data is None:
+                return self.pastebin_ca(req, data)
+            raise HTTPError(req.full_url, 400, 'Bad Request', {},
+                            io.BytesIO(b'{"error":"invalid_expiry"}'))
+
+        code, stdout, stderr = self.run_cli(
+            ['-b', 'pastebin.ca', '-e', 'bad'], 'test', rejected)
+        self.assertEqual(code, 1)
+        self.assertEqual(stdout, '')
+        self.assertIn('HTTP Error', stderr)
+
+    def test_response_without_view_url_does_not_print_raw_url(self):
+        def missing_url(req, data=None):
+            if data is None:
+                return self.pastebin_ca(req, data)
+            return response('{"raw_url":"https://pastebin.ca/2AbCdEfgHj/raw"}')
+
+        code, stdout, stderr = self.run_cli(
+            ['-b', 'pastebin.ca'], 'test', missing_url)
+        self.assertEqual(code, 1)
+        self.assertEqual(stdout, '')
+        self.assertIn('Unable to read or parse', stderr)
 
     def test_authenticated_stdin_uses_bearer_and_preserves_defaults(self):
         code, stdout, stderr = self.run_cli(
@@ -280,78 +369,6 @@ class ProviderTests(unittest.TestCase):
                     self.assertNotIn(TEST_TOKEN, stdout + stderr)
                     self.assertNotIn('https://pastebin.ca/', stdout)
                     self.assertIn('redirect', stderr.lower())
-
-    def test_each_input_file_gets_a_fresh_challenge_and_cli_options(self):
-        with tempfile.TemporaryDirectory() as directory:
-            files = [Path(directory) / 'one.txt', Path(directory) / 'two.txt']
-            files[0].write_text('first file\n')
-            files[1].write_text('second file\n')
-            code, stdout, stderr = self.run_cli([
-                '-b', 'https://pastebin.ca/', '-t', 'A test title',
-                '-f', 'python', '-e', '30m', '-P', 'public',
-                '-i', *map(str, files)])
-        self.assertEqual((code, stderr), (0, ''))
-        self.assertEqual(stdout.splitlines(), [
-            'https://pastebin.ca/2AbCdEfgHj',
-            'https://pastebin.ca/3AbCdEfgHj'])
-        self.assertEqual(len(self.challenges), 2)
-        self.assertEqual([p['body'] for p in self.submissions],
-                         ['first file', 'second file'])
-        self.assertNotEqual(self.submissions[0]['pow_challenge_id'],
-                            self.submissions[1]['pow_challenge_id'])
-        for payload in self.submissions:
-            self.assertEqual(payload['title'], 'A test title')
-            self.assertEqual(payload['syntax_hint'], 'python')
-            self.assertEqual(payload['expires_in'], '30m')
-            self.assertEqual(payload['visibility'], 'public')
-
-    def test_invalid_challenge_difficulty_does_not_submit(self):
-        for difficulty in (-1, 257, '22', True):
-            with self.subTest(difficulty=difficulty):
-                def bad_challenge(req, data=None):
-                    self.assertIsNone(data)
-                    return response(json.dumps({
-                        'challenge_id': 'bad', 'prefix': 'test',
-                        'difficulty_bits': difficulty}))
-
-                code, stdout, stderr = self.run_cli(
-                    ['-b', 'pastebin.ca'], 'test', bad_challenge)
-                self.assertEqual(code, 1)
-                self.assertEqual(stdout, '')
-                self.assertIn('Invalid proof-of-work difficulty', stderr)
-
-    def test_work_is_bounded_and_timeout_does_not_submit(self):
-        with mock.patch('time.monotonic', side_effect=[0, 31]):
-            code, stdout, stderr = self.run_cli(['-b', 'pastebin.ca'], 'test')
-        self.assertEqual(code, 1)
-        self.assertEqual(stdout, '')
-        self.assertIn('exceeded 30 seconds', stderr)
-        self.assertEqual(self.submissions, [])
-
-    def test_http_rejection_does_not_print_a_success_url(self):
-        def rejected(req, data=None):
-            if data is None:
-                return self.pastebin_ca(req, data)
-            raise HTTPError(req.full_url, 400, 'Bad Request', {},
-                            io.BytesIO(b'{"error":"invalid_expiry"}'))
-
-        code, stdout, stderr = self.run_cli(
-            ['-b', 'pastebin.ca', '-e', 'bad'], 'test', rejected)
-        self.assertEqual(code, 1)
-        self.assertEqual(stdout, '')
-        self.assertIn('HTTP Error', stderr)
-
-    def test_response_without_view_url_does_not_print_raw_url(self):
-        def missing_url(req, data=None):
-            if data is None:
-                return self.pastebin_ca(req, data)
-            return response('{"raw_url":"https://pastebin.ca/2AbCdEfgHj/raw"}')
-
-        code, stdout, stderr = self.run_cli(
-            ['-b', 'pastebin.ca'], 'test', missing_url)
-        self.assertEqual(code, 1)
-        self.assertEqual(stdout, '')
-        self.assertIn('Unable to read or parse', stderr)
 
     def test_existing_json_provider_keeps_its_header_and_string_fields(self):
         def bpa_st(req, data=None):
