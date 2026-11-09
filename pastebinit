@@ -71,6 +71,16 @@ class PasteRequest(request.Request):
             self.add_header('User-Agent', self.version)
 
 
+class PasteRedirectHandler(request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        if req.get_header('Authorization'):
+            raise HTTPError(req.full_url, code,
+                            _("Refusing to redirect an authenticated request"),
+                            headers, fp)
+        return super(PasteRedirectHandler, self).redirect_request(
+            req, fp, code, msg, headers, newurl)
+
+
 def preloadPastebins():
     # Check several places for config files:
     #  - global config in /etc/pastebin.d
@@ -470,6 +480,8 @@ if __name__ == "__main__":
             if len(user) > user_length:
                 spec_opts['user'] = "%s~" % user[:user_length-1]
 
+        auth_token = os.environ.get(config.get('auth_token_env', ''), '')
+
         for content in contents:
             # Get the parameters
             params = getParameters(config['basename'], content)
@@ -483,9 +495,17 @@ if __name__ == "__main__":
             req = PasteRequest(post_url)
 
             try:
+                if auth_token:
+                    if not re.fullmatch(r'[A-Za-z0-9._~+/-]+=*', auth_token):
+                        raise ValueError(_("Invalid bearer token"))
+                    if req.type != 'https':
+                        raise ValueError(
+                            _("Bearer authentication requires HTTPS"))
+                    req.add_unredirected_header('Authorization',
+                                                'Bearer ' + auth_token)
                 if post_format == 'json':
                     if json:
-                        if 'pow_page' in config:
+                        if 'pow_page' in config and not auth_token:
                             params.update(getPowParameters(website, config))
                         params = bytes(json.dumps(params), encoding='US-ASCII')
                         req.add_header('Content-Type',
@@ -501,15 +521,31 @@ if __name__ == "__main__":
                 if verbose:
                     print("POSTing to: %s\nParams: %s" % (
                           post_url, str(params)), file=sys.stderr)
-                page = request.urlopen(req, params)
+                if auth_token:
+                    page = request.build_opener(PasteRedirectHandler()).open(
+                        req, params)
+                else:
+                    page = request.urlopen(req, params)
             except HTTPError as e:
-                print(_("HTTP Error contacting the server: %s") % e, file=sys.stderr)
+                error = str(e)
+                if auth_token:
+                    error = error.replace(auth_token, '[redacted]')
+                print(_("HTTP Error contacting the server: %s") % error,
+                      file=sys.stderr)
                 if verbose:
+                    error_body = e.fp.read()
+                    if auth_token:
+                        error_body = error_body.replace(
+                            auth_token.encode('ascii'), b'[redacted]')
                     print(_("HTTP Error response body:"))
-                    print(e.fp.read())
+                    print(error_body)
                 sys.exit(1)
             except Exception as e:
-                print(_("Failed to contact the server: %s") % e, file=sys.stderr)
+                error = str(e)
+                if auth_token:
+                    error = error.replace(auth_token, '[redacted]')
+                print(_("Failed to contact the server: %s") % error,
+                      file=sys.stderr)
                 sys.exit(1)
 
             try:
