@@ -4,6 +4,7 @@ import contextlib
 import hashlib
 import io
 import json
+import os
 from pathlib import Path
 import runpy
 import tempfile
@@ -62,6 +63,7 @@ class ProviderTests(unittest.TestCase):
     def run_cli(self, arguments, content='', handler=None):
         stdout, stderr = io.StringIO(), io.StringIO()
         real_open = open
+        real_listdir = os.listdir
 
         def without_user_config(path, *args, **kwargs):
             # Machine/user preferences must not change provider-default tests.
@@ -69,9 +71,18 @@ class ProviderTests(unittest.TestCase):
                 raise FileNotFoundError(path)
             return real_open(path, *args, **kwargs)
 
+        def without_external_providers(path):
+            directory = Path(path)
+            if directory.name.endswith('pastebin.d') and \
+                    directory.resolve() != ROOT / 'pastebin.d':
+                return []
+            return real_listdir(path)
+
         with mock.patch('sys.argv', ['pastebinit'] + arguments), \
                 mock.patch('sys.stdin', io.StringIO(content)), \
                 mock.patch('builtins.open', side_effect=without_user_config), \
+                mock.patch('os.listdir', side_effect=without_external_providers), \
+                mock.patch('gettext.gettext', new=lambda message: message), \
                 mock.patch('urllib.request.urlopen',
                            side_effect=handler or self.pastebin_ca), \
                 contextlib.redirect_stdout(stdout), \

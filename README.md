@@ -93,8 +93,7 @@ can read them; unlisted does not mean encrypted or access-controlled. Use
 unlisted. Expiry (`-e`) is a positive integer followed by a unit: `s`, `m`, `h`,
 `d`, `w`, `mo` (30 days), or `y` (365 days). Anonymous pastes must expire within
 90 days. The service limits paste bodies to 1 MiB of UTF-8 text and titles to
-120 characters. Account-owned pastes and encrypted pastes are outside this
-provider's scope.
+120 characters.
 
 Each anonymous submission requests a fresh proof-of-work challenge. A
 `pow_page` endpoint returns `challenge_id`, `prefix`, and `difficulty_bits`;
@@ -106,7 +105,7 @@ use this flow unless they configure `pow_page`.
 
 The API contract is published at <https://pastebin.ca/api/v1/openapi.json>.
 
-## Offline provider tests
+# Offline provider tests
 
 Run `python3 -m unittest discover -s tests -v` to check request and response
 handling without submitting public pastes. The existing `test.sh` is a live

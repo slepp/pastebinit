@@ -169,7 +169,7 @@ def getPowParameters(website, config):
 
     difficulty = challenge['difficulty_bits']
     if type(difficulty) is not int or not 0 <= difficulty <= 256:
-        raise ValueError("Invalid proof-of-work difficulty")
+        raise ValueError(_("Invalid proof-of-work difficulty"))
 
     prefix = challenge['prefix'].encode('utf-8')
     target = 1 << (256 - difficulty)
@@ -183,7 +183,7 @@ def getPowParameters(website, config):
                     'pow_nonce': value}
         nonce += 1
 
-    raise ValueError("Proof-of-work challenge exceeded 30 seconds")
+    raise ValueError(_("Proof-of-work challenge exceeded 30 seconds"))
 
 
 # XML Handling methods
