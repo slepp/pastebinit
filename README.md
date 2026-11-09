@@ -25,6 +25,9 @@ Under `[pastebin]`, you will want to keep the basic information to identify the 
 | post_page    | used to specify a page to which to post data. it is the actual URL of the pastebin's form.
 | paste_regexp | used to specify a regular expression to execute on the resulting page after posting. this is useful to deal with special pastebins that don't redirect you to the new paste's URL.
 | target_page  | used to compose the paste URL in combination with paste_regexp. the use of `%%s` as a placeholder e.g. for the paste ID is supported.
+| content_type | overrides the `Content-Type` header for `post_format = json` (default: `text/json`).
+| auth_token_env | optional name of an environment variable containing a Bearer API key. Authenticated requests require HTTPS.
+| pow_page     | optional relative URL for a pastebin.ca-compatible JSON proof-of-work challenge. See below.
 
 Furthermore, there are the self-explanatory `https`, `post_format`, and `sizelimit` settings.
 
@@ -74,3 +77,43 @@ To reuse the example above, statically set a post to expire after 365 days:
 expiry = 365
 ```
 Here, the value `365` will be assigned to the `expiry` keyword. In the `[format]` section, the value in the `expiry` keyword is applied to the field called `expire`.
+
+# pastebin.ca
+
+Pastebin.ca accepts text from stdin or files through its HTTPS JSON API:
+
+```sh
+printf 'Example terminal output\n' | pastebinit -b pastebin.ca
+pastebinit -b pastebin.ca -i build.log -t 'Build output' -f text -e 1d
+```
+
+Pastes are unlisted and expire after seven days by default. Anyone with the link
+can read them; unlisted does not mean encrypted or access-controlled. Use
+`-P public` to include a paste in the public feed, or `-P unlisted` to keep it
+unlisted. Expiry (`-e`) is a positive integer followed by a unit: `s`, `m`, `h`,
+`d`, `w`, `mo` (30 days), or `y` (365 days). Anonymous pastes must expire within
+90 days. The service limits paste bodies to 1 MiB of UTF-8 text and titles to
+120 characters.
+
+To create pastes under your account, export an API key with the `paste:create`
+scope as `PBCA_API_KEY`, then run the same commands. Keys are available from
+<https://pastebin.ca/account>. The key is sent in the `Authorization: Bearer`
+header, and authenticated submissions skip proof-of-work. A missing or empty
+variable uses anonymous posting. A rejected key or an authenticated redirect
+ends the command with an error.
+
+Each anonymous submission requests a fresh proof-of-work challenge. A
+`pow_page` endpoint returns `challenge_id`, `prefix`, and `difficulty_bits`;
+pastebinit finds a decimal nonce for which SHA-256 of the UTF-8 prefix followed
+by the nonce has the requested number of leading zero bits. The JSON submission
+includes `pow_challenge_id` and `pow_nonce`. Solving is limited to 30 seconds,
+and a new challenge is requested for each input file. Existing providers do not
+use this flow unless they configure `pow_page`.
+
+The API contract is published at <https://pastebin.ca/api/v1/openapi.json>.
+
+# Offline provider tests
+
+Run `python3 -m unittest discover -s tests -v` to check request and response
+handling without submitting public pastes. The existing `test.sh` is a live
+test that submits to every configured provider.
